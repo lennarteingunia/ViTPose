@@ -17,6 +17,11 @@ later stage, so they can be redone without re-running inference.
 `--rotate` de-rotates in the same step, for footage shot with the camera turned on its
 side; the keypoints are then in the *rotated* image frame, which `rotation` records.
 
+The detector runs in **half precision** by default (`det_fp16`), which measured 36.3 -> 27.4 ms
+on an A5000 while leaving the boxes alone: the same 3.031 detections per frame and median IoU
+0.9994 against fp32, over two camera views. It is skipped with a note on a non-CUDA device.
+Set `det_fp16: false` through `--overrides` to go back to fp32.
+
 `--batch` processes B frames together: one detector forward pass for the B frames, then one
 pose forward pass for all their detections. mmpose already batches the detections *within* a
 frame (`mmpose/apis/inference.py:280`), so at 3.03 detections per frame that goes from batch
@@ -36,6 +41,7 @@ import glob
 import json
 import os
 import os.path as osp
+import sys
 from typing import Iterator, Sequence
 
 import numpy as np
@@ -50,11 +56,17 @@ DEFAULTS = {
     "det_checkpoint": "pretrained_models/mmdet/"
                       "faster_rcnn_r50_fpn_1x_coco_20200130-047c8118.pth",
     "device": "cuda:0",
+    "det_fp16": True,   # task 20: half precision on the detector, ~25 % off its forward pass
     "bbox_thr": 0.3,
     "det_cat_id": 1,   # person class in the COCO detector
 }
 
 ROTATIONS = ("0", "90ccw", "90cw")
+
+# Frames per detector forward pass. 8 was the fastest configuration measured on an A5000
+# (8.73 fps against 8.56 at batch 1, with fp16); the margin over batch 4 is inside run-to-run
+# noise, so 4 is equally defensible if the buffered frames ever cost too much RAM.
+DEFAULT_BATCH = 8
 
 # Batches held ready ahead of the GPU. Two is enough to keep it fed; more only costs RAM,
 # and a prepared frame carries both the decoded image and its float32 detector tensor.
@@ -133,6 +145,26 @@ def iter_dir_frames(paths: Sequence[str], start: int, count: int | None) -> Iter
         if img is None:
             raise SystemExit(f"cannot read frame {paths[index]}")
         yield index, img
+
+
+def apply_det_fp16(det_model, enabled: bool, device: str) -> bool:
+    """Wrap the detector for half-precision inference. Returns whether it was applied.
+
+    `wrap_fp16_model` casts the weights to half, which most CPU kernels do not implement,
+    so on a non-CUDA device this is skipped with a note rather than raised: the CPU paths
+    (`scripts/smoke_models.py`, the fixture runs) have to keep working. Measured on an
+    A5000 over two views: detector 36.3 -> 27.4 ms, boxes unchanged to median IoU 0.9994
+    with the same 3.031 detections per frame, see `notes/detector-selection.md`.
+    """
+    if not enabled:
+        return False
+    if not str(device).startswith("cuda"):
+        print(f"det_fp16: skipped, half precision needs a CUDA device, got {device}",
+              file=sys.stderr)
+        return False
+    from mmcv.runner import wrap_fp16_model
+    wrap_fp16_model(det_model)
+    return True
 
 
 def build_det_pipeline(det_model):
@@ -337,8 +369,9 @@ def main() -> None:
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--count", type=int, default=None)
     ap.add_argument("--rotate", choices=ROTATIONS, default="0")
-    ap.add_argument("--batch", type=int, default=1,
-                    help="frames per detector forward pass (pose stays per frame)")
+    ap.add_argument("--batch", type=int, default=DEFAULT_BATCH,
+                    help="frames per detector forward pass (pose stays per frame); "
+                         f"default {DEFAULT_BATCH}")
     ap.add_argument("--no-prefetch", dest="prefetch", action="store_false",
                     help="decode and preprocess inline instead of on a worker thread")
     ap.add_argument("--config", default=None)
@@ -371,6 +404,7 @@ def main() -> None:
     det_model = init_detector(
         _abs(cfg_d["det_config"]), _abs(cfg_d["det_checkpoint"]), device=cfg_d["device"]
     )
+    det_fp16_applied = apply_det_fp16(det_model, cfg_d["det_fp16"], cfg_d["device"])
 
     dataset_info = DatasetInfo(pose_model.cfg.data["test"]["dataset_info"])
     pose_pipeline = build_pose_pipeline(pose_model)
@@ -432,6 +466,11 @@ def main() -> None:
         det_checkpoint=np.array(_abs(cfg_d["det_checkpoint"])),
         bbox_thr=np.array(cfg_d["bbox_thr"], dtype=np.float32),
         det_cat_id=np.array(cfg_d["det_cat_id"], dtype=np.int64),
+        # Both of these change the numbers below, so the file has to carry them: fp16 moves
+        # the boxes by ~1e-4 px and `--batch > 1` by ~2e-4, either of which can flip a
+        # heatmap-argmax tie. See `notes/detector-selection.md`.
+        det_fp16=np.array(bool(det_fp16_applied)),
+        batch=np.array(args.batch, dtype=np.int64),
     )
     print(
         f"wrote {args.out}  ({len(frame_indices)} frames, {len(det_xy)} detections, "
